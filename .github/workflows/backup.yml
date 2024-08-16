@@ -1,4 +1,4 @@
-name: Backup Fork
+name: Backup Fork and Sync
 
 on:
   schedule:
@@ -6,54 +6,93 @@ on:
   workflow_dispatch:  # 允許手動觸發
 
 jobs:
-  backup:
+  backup-and-sync:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0  # 獲取所有歷史記錄和標籤
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: List all branches
-        id: list_branches
+      - name: Configure Git
         run: |
-          git fetch --all
-          git branch -r | grep -v '\->' | grep 'upstream/' | sed 's/upstream\///' > branches.txt
-          echo "branches=$(cat branches.txt | tr '\n' ' ')" >> $GITHUB_OUTPUT
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git config --global checkout.defaultRemote origin
 
       - name: Add upstream repository
         run: |
           git remote add upstream https://github.com/CMU-Perceptual-Computing-Lab/openpose.git
-          git fetch upstream
+          git fetch --all --tags
 
-      - name: Backup each branch
+      - name: Sync and handle conflicts
         run: |
-          for branch in $(echo "${{ steps.list_branches.outputs.branches }}"); do
-            git checkout $branch || git checkout -b $branch upstream/$branch
-            git merge upstream/$branch || echo "No changes to merge or merge conflict"
-            git push --tags backup $branch || echo "Failed to push $branch to backup repository"
+          # 獲取所有本地分支
+          branches=$(git branch -r | grep 'origin/' | grep -v 'origin/HEAD' | sed 's/origin\///')
+          
+          for branch in $branches; do
+            echo "Processing branch: $branch"
+            
+            # 檢查分支是否存在於上游
+            if git ls-remote --exit-code --heads upstream $branch > /dev/null 2>&1; then
+              # 切換到分支
+              git checkout -B $branch origin/$branch
+              
+              # 嘗試合併上游更改
+              if git merge upstream/$branch --no-edit; then
+                echo "Successfully merged changes for $branch"
+                git push origin $branch
+              else
+                echo "Merge conflict in $branch. Attempting automatic resolution..."
+                
+                # 嘗試自動解決衝突
+                git diff --name-only --diff-filter=U | xargs git checkout --theirs
+                git add .
+                git commit -m "Auto-resolve conflicts in $branch"
+                
+                # 推送更改
+                if git push origin $branch; then
+                  echo "Pushed auto-resolved changes for $branch"
+                else
+                  echo "Failed to push changes for $branch. Manual intervention required."
+                  git merge --abort
+                fi
+              fi
+            else
+              echo "Branch $branch does not exist in upstream. Skipping."
+            fi
           done
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-
-      - name: Configure Git
-        run: |
-          git config --global user.name 'github-actions'
-          git config --global user.email 'github-actions@github.com'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create version tag
         run: |
           TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-          git tag -a "backup-$TIMESTAMP" -m "Backup on $TIMESTAMP"
+          git tag -a "sync-$TIMESTAMP" -m "Sync on $TIMESTAMP"
+          git push --tags origin
 
-      - name: Push changes and tags to backup
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      - name: Generate sync report
+        if: always()
         run: |
-          git remote add backup https://$GH_TOKEN@github.com/LostSunset/openpose.git
-          git push backup --tags || echo "Failed to push tags to backup repository"
+          echo "Sync Report" > sync_report.md
+          echo "===========" >> sync_report.md
+          echo "" >> sync_report.md
+          git branch -r | grep 'origin/' | grep -v 'origin/HEAD' | sed 's/origin\///' | while read branch; do
+            echo "## Branch: $branch" >> sync_report.md
+            if git log HEAD..origin/$branch --oneline | grep -q .; then
+              echo "Status: Changes pushed" >> sync_report.md
+              echo "Changes:" >> sync_report.md
+              git log HEAD..origin/$branch --oneline >> sync_report.md
+            else
+              echo "Status: No changes or sync failed" >> sync_report.md
+            fi
+            echo "" >> sync_report.md
+          done
 
-      - name: Check for errors
-        if: failure()
-        run: |
-          echo "Workflow failed. Please check the logs for more information."
+      - name: Upload sync report
+        if: always()
+        uses: actions/upload-artifact@v2
+        with:
+          name: sync-report
+          path: sync_report.md
